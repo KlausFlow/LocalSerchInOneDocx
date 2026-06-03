@@ -7,6 +7,7 @@
 
 import argparse
 from collections import Counter
+from difflib import SequenceMatcher
 import math
 import re
 import sys
@@ -23,6 +24,34 @@ DEFAULT_ANSWERER = "simple"
 MIN_RETRIEVAL_SCORE = 0.45
 NO_ANSWER_MESSAGE = "В документе нет достаточной информации для ответа."
 DEFAULT_MAX_ANSWER_SENTENCES = 3
+MIN_ANSWER_SENTENCE_SCORE = 0.25
+MIN_QUERY_TERM_COVERAGE = 0.5
+WHY_ANSWER_CUES = ("потому", "так как", "поскольку", "из-за", "из за", "это объясняется")
+SYNONYM_GROUPS = (
+    {
+        "выкинуть", "выкинули", "выкинул", "выкинула", "выкинуло", "выкинут",
+        "выбрасывать", "выбросить", "выбросили", "выбросил", "выбросила",
+        "выброшен", "выброшена", "выброшено", "выброшенный", "выброшенную",
+        "вышвырнуть", "вышвырнули", "вышвырнул", "вышвырнула",
+    },
+)
+TERM_SYNONYMS = {
+    term: group
+    for group in SYNONYM_GROUPS
+    for term in group
+}
+RUSSIAN_STOPWORDS = {
+    "кто", "что", "какой", "какая", "какие", "какое",
+    "как", "почему", "зачем", "где", "когда",
+    "это", "этот", "эта", "эти", "такой", "такая", "такие",
+    "в", "во", "на", "по", "к", "ко", "с", "со", "из", "от", "до",
+    "для", "чего", "чем",
+    "и", "а", "но", "или", "же", "ли",
+    "был", "была", "были", "будет", "есть",
+    "нужен", "нужна", "нужно", "нужны",
+    "году", "года", "год",
+    "вещь", "вещи", "предмет", "предметы",
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -195,6 +224,94 @@ def tokenize_words(text: str) -> list[str]:
     return re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text.lower())
 
 
+def get_meaningful_query_terms(question: str) -> list[str]:
+    """Вернуть смысловые термины вопроса без частых служебных слов."""
+    tokens = tokenize_words(question)
+    meaningful = [
+        token
+        for token in tokens
+        if token not in RUSSIAN_STOPWORDS
+        and (len(token) >= 3 or (token.isascii() and len(token) >= 2))
+    ]
+    return meaningful or tokens
+
+
+
+def normalized_question_start(question: str) -> str:
+    """Вернуть начало вопроса в виде нормализованной строки токенов."""
+    return " ".join(tokenize_words(question))
+
+
+def is_definition_question(question: str) -> bool:
+    """Проверить, похож ли вопрос на запрос определения сущности."""
+    normalized = normalized_question_start(question)
+    return (
+        normalized.startswith("кто такой ")
+        or normalized.startswith("кто такая ")
+        or normalized.startswith("кто такие ")
+        or normalized.startswith("что такое ")
+        or normalized.startswith("что называется ")
+        or normalized.startswith("что представляет собой ")
+    )
+
+
+def is_why_question(question: str) -> bool:
+    """Проверить, начинается ли вопрос с 'почему'."""
+    return normalized_question_start(question).startswith("почему ")
+
+
+def is_object_question(question: str) -> bool:
+    """Проверить, похож ли вопрос на запрос конкретного объекта/списка объектов."""
+    normalized = normalized_question_start(question)
+    if is_definition_question(question):
+        return False
+    return normalized.startswith("что ") or normalized.startswith("какие ")
+
+
+def char_ngrams(token: str, n: int = 3) -> set[str]:
+    """Вернуть символьные n-граммы токена для грубого сравнения форм слов."""
+    if len(token) < n:
+        return {token}
+    return {token[index:index + n] for index in range(len(token) - n + 1)}
+
+
+def char_ngram_overlap(left: str, right: str) -> float:
+    """Оценить похожесть слов по общим символьным триграммам."""
+    left_ngrams = char_ngrams(left)
+    right_ngrams = char_ngrams(right)
+    if not left_ngrams or not right_ngrams:
+        return 0.0
+    return len(left_ngrams & right_ngrams) / min(len(left_ngrams), len(right_ngrams))
+
+
+def terms_match(query_term: str, text_token: str) -> bool:
+    """Проверить, совпадают ли термины с учетом небольших различий формы."""
+    if query_term == text_token:
+        return True
+    if text_token in TERM_SYNONYMS.get(query_term, set()):
+        return True
+    if len(query_term) >= 4 and len(text_token) >= 4:
+        if query_term in text_token or text_token in query_term:
+            return True
+    if query_term[0] != text_token[0]:
+        return False
+    if SequenceMatcher(None, query_term, text_token).ratio() >= 0.82:
+        return True
+    if len(query_term) >= 5 and len(text_token) >= 5:
+        return char_ngram_overlap(query_term, text_token) >= 0.5
+    return False
+
+
+def matched_query_terms(question: str, text: str) -> set[str]:
+    """Вернуть смысловые термины вопроса, найденные в тексте."""
+    query_terms = set(get_meaningful_query_terms(question))
+    text_tokens = tokenize_words(text)
+    matched: set[str] = set()
+    for term in query_terms:
+        if any(terms_match(term, token) for token in text_tokens):
+            matched.add(term)
+    return matched
+
 def bm25_scores(
     question: str,
     chunks: list[dict[str, object]],
@@ -205,7 +322,7 @@ def bm25_scores(
     if not chunks:
         return []
 
-    query_terms = tokenize_words(question)
+    query_terms = get_meaningful_query_terms(question)
     if not query_terms:
         return [0.0] * len(chunks)
 
@@ -277,6 +394,44 @@ def normalize_scores(scores: list[float]) -> list[float]:
     return [(score - min_score) / (max_score - min_score) for score in scores]
 
 
+
+def definition_position_boost(question: str, chunk: dict[str, object], index: int, total: int) -> float:
+    """Универсальный небольшой бонус ранним фрагментам для вопросов-определений."""
+    if not is_definition_question(question):
+        return 0.0
+    coverage = term_coverage_score(question, str(chunk["text"]))
+    if coverage == 0.0:
+        return 0.0
+    if total <= 1:
+        return 0.2 * coverage
+    early_score = 1 - index / (total - 1)
+    return 0.25 * coverage * early_score
+
+
+def apply_definition_reranking(
+    question: str,
+    chunks: list[dict[str, object]],
+    scores: list[float],
+) -> list[float]:
+    """Для однотерминных вопросов-определений сильнее учитывать первое появление термина."""
+    if not is_definition_question(question):
+        return scores
+    if len(get_meaningful_query_terms(question)) > 2:
+        return scores
+    total = len(chunks)
+    if total <= 1:
+        return scores
+
+    reranked: list[float] = []
+    for index, (chunk, score) in enumerate(zip(chunks, scores)):
+        coverage = term_coverage_score(question, str(chunk["text"]))
+        if coverage == 0.0:
+            reranked.append(score)
+            continue
+        early_score = 1 - index / (total - 1)
+        reranked.append(0.05 * score + 0.95 * coverage * early_score)
+    return reranked
+
 def retrieve_top_chunks(
     question: str,
     chunks: list[dict[str, object]],
@@ -298,6 +453,15 @@ def retrieve_top_chunks(
         0.6 * bm25_score + 0.4 * tfidf_score
         for bm25_score, tfidf_score in zip(bm25, tfidf)
     ]
+    final_scores = [
+        0.35 * score + 0.65 * best_chunk_sentence_score(question, chunk)
+        for score, chunk in zip(final_scores, chunks)
+    ]
+    final_scores = [
+        score + definition_position_boost(question, chunk, index, len(chunks))
+        for index, (score, chunk) in enumerate(zip(final_scores, chunks))
+    ]
+    final_scores = apply_definition_reranking(question, chunks, final_scores)
 
     if not final_scores or max(final_scores) == 0:
         return []
@@ -314,6 +478,10 @@ def retrieve_top_chunks(
             continue
 
         chunk = chunks[index]
+        coverage = term_coverage_score(question, str(chunk["text"]))
+        if coverage < MIN_QUERY_TERM_COVERAGE:
+            continue
+
         retrieved_chunks.append(
             {
                 "id": chunk["id"],
@@ -323,6 +491,7 @@ def retrieve_top_chunks(
                 "score": float(final_scores[index]),
                 "bm25_score": float(bm25[index]),
                 "tfidf_score": float(tfidf[index]),
+                "coverage_score": float(coverage),
             }
         )
         if len(retrieved_chunks) == top_k:
@@ -335,26 +504,91 @@ def split_into_sentences(text: str) -> list[str]:
     """Разбить текст на простые предложения."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n+", ". ", text)
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    # Многоточие тоже считаем границей предложения: в художественных текстах
+    # после него часто начинается новая смысловая фраза.
+    text = text.replace("…", "…. ")
+    sentences = re.split(r"(?<=[.!?…])\s+", text)
     return [" ".join(sentence.split()) for sentence in sentences if sentence.strip()]
 
 
 def sentence_overlap_score(question: str, sentence: str) -> float:
-    """Оценить пересечение токенов вопроса и предложения."""
-    question_tokens = set(tokenize_words(question))
-    if not question_tokens:
+    """Оценить пересечение смысловых терминов вопроса и предложения."""
+    question_terms = set(get_meaningful_query_terms(question))
+    if not question_terms:
         return 0.0
 
-    sentence_tokens = set(tokenize_words(sentence))
-    common_tokens = question_tokens & sentence_tokens
-    score = len(common_tokens) / len(question_tokens)
+    matched_terms = matched_query_terms(question, sentence)
+    score = len(matched_terms) / len(question_terms)
 
     sentence_lower = sentence.lower()
-    for token in question_tokens:
-        if len(token) >= 4 and token in sentence_lower:
+    for term in question_terms:
+        if len(term) >= 4 and term in sentence_lower:
             score += 0.05
 
     return score
+
+
+def term_coverage_score(question: str, text: str) -> float:
+    """Оценить покрытие смысловых терминов вопроса текстом."""
+    question_terms = set(get_meaningful_query_terms(question))
+    if not question_terms:
+        return 0.0
+    return len(matched_query_terms(question, text)) / len(question_terms)
+
+
+def why_answer_cue_score(question: str, sentence: str) -> float:
+    """Дать небольшой бонус предложениям с причинным ответом для why-вопросов."""
+    if not is_why_question(question):
+        return 0.0
+    sentence_lower = sentence.lower().strip(" —-–")
+    if sentence_lower.startswith(WHY_ANSWER_CUES):
+        return 0.35
+    if any(cue in sentence_lower for cue in WHY_ANSWER_CUES):
+        return 0.2
+    return 0.0
+
+
+def generic_object_answer_penalty(question: str, sentence: str) -> float:
+    """Штрафовать общие рассуждения вместо конкретного объекта в object-вопросах."""
+    if not is_object_question(question):
+        return 0.0
+    sentence_lower = sentence.lower()
+    generic_markers = (
+        "все, что", "всё, что", "все что", "всё что",
+        "всякий", "всякая", "всякое", "любой", "любая", "любое",
+        "прочие", "прочих", "предметы", "предметов", "вещи", "вещей",
+        "разные предметы", "прочие предметы", "свита", "свитой",
+    )
+    if any(marker in sentence_lower for marker in generic_markers):
+        return 0.7
+    if "что бы" in sentence_lower and " ни " in sentence_lower:
+        return 0.7
+    question_tokens = set(tokenize_words(question))
+    sentence_tokens = set(tokenize_words(sentence))
+    if "бы" in sentence_tokens and "бы" not in question_tokens:
+        return 0.35
+    return 0.0
+
+
+def score_sentence(question: str, sentence: str) -> float:
+    """Оценить релевантность предложения вопросу."""
+    overlap_score = sentence_overlap_score(question, sentence)
+    coverage_score = term_coverage_score(question, sentence)
+    cue_score = why_answer_cue_score(question, sentence)
+    penalty = generic_object_answer_penalty(question, sentence)
+    return max(0.0, 0.45 * overlap_score + 0.45 * coverage_score + cue_score - penalty)
+
+
+def best_chunk_sentence_score(question: str, chunk: dict[str, object]) -> float:
+    """Вернуть лучший sentence-level score внутри чанка."""
+    scores = [
+        score_sentence(question, sentence)
+        for sentence in split_into_sentences(str(chunk["text"]))
+        if is_valid_answer_sentence(sentence)
+    ]
+    if not scores:
+        return 0.0
+    return max(scores)
 
 
 def is_valid_answer_sentence(sentence: str) -> bool:
@@ -416,46 +650,60 @@ def generate_simple_answer(
     if not retrieved_chunks:
         return NO_ANSWER_MESSAGE
 
-    seen_sentences: set[str] = set()
+    if is_definition_question(question):
+        max_sentences = min(max_sentences, 1)
+
+    unique_sentences: list[str] = []
     scored_sentences: list[tuple[float, int, int, str]] = []
-    fallback_candidates: list[str] = []
 
     for chunk_index, chunk in enumerate(retrieved_chunks):
         sentences = split_into_sentences(str(chunk["text"]))
-        if chunk_index == 0:
-            fallback_candidates = sentences
 
         for sentence_index, sentence in enumerate(sentences):
             normalized_sentence = " ".join(sentence.split())
             if not is_valid_answer_sentence(normalized_sentence):
                 continue
 
-            sentence_key = normalized_sentence.lower()
-            if sentence_key in seen_sentences:
+            if is_duplicate_sentence(normalized_sentence, unique_sentences):
                 continue
 
-            seen_sentences.add(sentence_key)
-            score = sentence_overlap_score(question, normalized_sentence)
-            if score > 0:
+            unique_sentences.append(normalized_sentence)
+            score = score_sentence(question, normalized_sentence)
+            if score >= MIN_ANSWER_SENTENCE_SCORE:
                 scored_sentences.append(
                     (score, chunk_index, sentence_index, normalized_sentence)
                 )
 
-    if scored_sentences:
-        scored_sentences.sort(key=lambda item: (-item[0], item[1], item[2]))
-        ordered_candidates = [
-            sentence for _, _, _, sentence in scored_sentences
-        ]
-        selected_sentences = select_unique_valid_sentences(
-            ordered_candidates,
-            max_sentences,
-        )
-    else:
-        selected_sentences = select_unique_valid_sentences(
-            fallback_candidates,
-            min(2, max_sentences),
-        )
+    if not scored_sentences:
+        return NO_ANSWER_MESSAGE
 
+    if is_why_question(question):
+        cue_sentences = [
+            item for item in scored_sentences
+            if why_answer_cue_score(question, item[3]) > 0
+        ]
+        if cue_sentences:
+            scored_sentences = cue_sentences
+
+    best_score = max(score for score, _, _, _ in scored_sentences)
+    dynamic_threshold = max(MIN_ANSWER_SENTENCE_SCORE, best_score * 0.8)
+    scored_sentences = [
+        item for item in scored_sentences
+        if item[0] >= dynamic_threshold
+    ]
+    if not scored_sentences:
+        return NO_ANSWER_MESSAGE
+
+    scored_sentences.sort(key=lambda item: (-item[0], item[1], item[2]))
+    selected = scored_sentences[:max_sentences]
+    selected.sort(key=lambda item: (item[1], item[2]))
+    selected_sentences = [sentence for _, _, _, sentence in selected]
+
+    selected_sentences = [
+        sentence
+        for sentence in selected_sentences
+        if is_valid_answer_sentence(sentence)
+    ]
     if not selected_sentences:
         return NO_ANSWER_MESSAGE
 
