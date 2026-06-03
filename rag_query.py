@@ -21,6 +21,8 @@ DEFAULT_TOP_K = 3
 DEFAULT_RETRIEVER = "hybrid"
 DEFAULT_ANSWERER = "simple"
 MIN_RETRIEVAL_SCORE = 0.45
+NO_ANSWER_MESSAGE = "В документе нет достаточной информации для ответа."
+DEFAULT_MAX_ANSWER_SENTENCES = 3
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -329,6 +331,171 @@ def retrieve_top_chunks(
     return retrieved_chunks
 
 
+def split_into_sentences(text: str) -> list[str]:
+    """Разбить текст на простые предложения."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n+", ". ", text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return [" ".join(sentence.split()) for sentence in sentences if sentence.strip()]
+
+
+def sentence_overlap_score(question: str, sentence: str) -> float:
+    """Оценить пересечение токенов вопроса и предложения."""
+    question_tokens = set(tokenize_words(question))
+    if not question_tokens:
+        return 0.0
+
+    sentence_tokens = set(tokenize_words(sentence))
+    common_tokens = question_tokens & sentence_tokens
+    score = len(common_tokens) / len(question_tokens)
+
+    sentence_lower = sentence.lower()
+    for token in question_tokens:
+        if len(token) >= 4 and token in sentence_lower:
+            score += 0.05
+
+    return score
+
+
+def is_valid_answer_sentence(sentence: str) -> bool:
+    """Проверить, что предложение достаточно полное для ответа."""
+    sentence = sentence.strip()
+    tokens = tokenize_words(sentence)
+    if len(tokens) < 3:
+        return False
+    if len(sentence) < 20:
+        return False
+    return True
+
+
+def token_overlap_ratio(left: str, right: str) -> float:
+    """Оценить долю пересечения токенов между двумя предложениями."""
+    left_tokens = set(tokenize_words(left))
+    right_tokens = set(tokenize_words(right))
+    if not left_tokens or not right_tokens:
+        return 0.0
+
+    intersection = left_tokens & right_tokens
+    return len(intersection) / min(len(left_tokens), len(right_tokens))
+
+
+def is_duplicate_sentence(sentence: str, selected_sentences: list[str]) -> bool:
+    """Проверить, повторяет ли предложение уже выбранный смысловой фрагмент."""
+    return any(
+        token_overlap_ratio(sentence, selected) >= 0.7
+        for selected in selected_sentences
+    )
+
+
+def select_unique_valid_sentences(
+    sentences: list[str],
+    max_sentences: int,
+) -> list[str]:
+    """Выбрать валидные предложения без коротких обрубков и смысловых дублей."""
+    selected_sentences: list[str] = []
+    for sentence in sentences:
+        normalized_sentence = " ".join(sentence.split())
+        if not is_valid_answer_sentence(normalized_sentence):
+            continue
+        if is_duplicate_sentence(normalized_sentence, selected_sentences):
+            continue
+
+        selected_sentences.append(normalized_sentence)
+        if len(selected_sentences) == max_sentences:
+            break
+
+    return selected_sentences
+
+
+def generate_simple_answer(
+    question: str,
+    retrieved_chunks: list[dict[str, object]],
+    max_sentences: int = DEFAULT_MAX_ANSWER_SENTENCES,
+) -> str:
+    """Собрать краткий extractive-ответ из найденных чанков."""
+    if not retrieved_chunks:
+        return NO_ANSWER_MESSAGE
+
+    seen_sentences: set[str] = set()
+    scored_sentences: list[tuple[float, int, int, str]] = []
+    fallback_candidates: list[str] = []
+
+    for chunk_index, chunk in enumerate(retrieved_chunks):
+        sentences = split_into_sentences(str(chunk["text"]))
+        if chunk_index == 0:
+            fallback_candidates = sentences
+
+        for sentence_index, sentence in enumerate(sentences):
+            normalized_sentence = " ".join(sentence.split())
+            if not is_valid_answer_sentence(normalized_sentence):
+                continue
+
+            sentence_key = normalized_sentence.lower()
+            if sentence_key in seen_sentences:
+                continue
+
+            seen_sentences.add(sentence_key)
+            score = sentence_overlap_score(question, normalized_sentence)
+            if score > 0:
+                scored_sentences.append(
+                    (score, chunk_index, sentence_index, normalized_sentence)
+                )
+
+    if scored_sentences:
+        scored_sentences.sort(key=lambda item: (-item[0], item[1], item[2]))
+        ordered_candidates = [
+            sentence for _, _, _, sentence in scored_sentences
+        ]
+        selected_sentences = select_unique_valid_sentences(
+            ordered_candidates,
+            max_sentences,
+        )
+    else:
+        selected_sentences = select_unique_valid_sentences(
+            fallback_candidates,
+            min(2, max_sentences),
+        )
+
+    if not selected_sentences:
+        return NO_ANSWER_MESSAGE
+
+    answer = " ".join(selected_sentences).strip()
+    answer_sentences = split_into_sentences(answer)
+    selected_answer_sentences = select_unique_valid_sentences(
+        answer_sentences,
+        max_sentences,
+    )
+
+    answer = " ".join(selected_answer_sentences).strip()
+    if not answer:
+        return NO_ANSWER_MESSAGE
+
+    return answer
+
+
+def build_prompt(question: str, retrieved_chunks: list[dict[str, object]]) -> str:
+    """Собрать prompt для будущей LLM только из найденных фрагментов."""
+    lines = [
+        "Отвечай только по найденным фрагментам документа.",
+        (
+            "Если информации недостаточно, напиши: "
+            f"{NO_ANSWER_MESSAGE}"
+        ),
+        "",
+        f"Вопрос: {question}",
+        "",
+        "Фрагменты:",
+    ]
+
+    if not retrieved_chunks:
+        lines.append("Релевантные фрагменты не найдены.")
+    else:
+        for chunk in retrieved_chunks:
+            lines.append(f"chunk {chunk['id']}: {chunk['text']}")
+
+    return "\n".join(lines)
+
+
 def make_preview(text: str, limit: int = 200) -> str:
     """Сделать однострочный preview текста с ограничением длины."""
     preview = " ".join(text.split())
@@ -342,9 +509,10 @@ def print_pipeline_stub_summary(
     text: str,
     chunks: list[dict[str, object]],
     retrieved_chunks: list[dict[str, object]],
+    answer: str,
 ) -> None:
     """Вывести единый summary для текущего состояния pipeline."""
-    print("CLI, загрузка документа, чанкинг и retrieval работают.")
+    print("CLI, загрузка документа, чанкинг, retrieval и answerer работают.")
     print("Текущая конфигурация:")
     print(f"document: {args.document}")
     print(f"question: {args.question}")
@@ -360,6 +528,9 @@ def print_pipeline_stub_summary(
     print(f"chunks: {len(chunks)}")
     print(f"retrieved_chunks: {len(retrieved_chunks)}")
 
+    print("Ответ:")
+    print(answer)
+
     print("Найденные источники:")
     if not retrieved_chunks:
         print("Релевантные фрагменты не найдены.")
@@ -373,7 +544,7 @@ def print_pipeline_stub_summary(
             f"{preview}"
         )
 
-    print("Answerer будет реализован на следующем этапе.")
+    print("Финальное оформление вывода будет уточнено на следующем этапе.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -385,11 +556,12 @@ def main(argv: list[str] | None = None) -> int:
         text = load_document(args.document)
         chunks = split_into_chunks(text, args.chunk_size, args.overlap)
         retrieved_chunks = retrieve_top_chunks(args.question, chunks, args.top_k)
+        answer = generate_simple_answer(args.question, retrieved_chunks)
     except ValueError as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 2
 
-    print_pipeline_stub_summary(args, text, chunks, retrieved_chunks)
+    print_pipeline_stub_summary(args, text, chunks, retrieved_chunks, answer)
     return 0
 
 
