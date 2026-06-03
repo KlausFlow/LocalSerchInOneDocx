@@ -1,11 +1,12 @@
 """CLI-скрипт для MVP RAG по одному txt-документу.
 
-На текущем этапе реализованы только разбор и проверка аргументов.
-Загрузка документа, локальный retrieval и формирование ответа будут
-добавлены на следующих этапах.
+На текущем этапе реализованы разбор аргументов, проверки, загрузка
+txt-документа и нормализация текста. Чанкинг, локальный retrieval и
+формирование ответа будут добавлены на следующих этапах.
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -84,17 +85,59 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Число источников top_k должно быть больше 0.")
 
 
+def load_document(path: str | Path) -> str:
+    """Загрузить поддерживаемый документ и вернуть нормализованный текст."""
+    document_path = Path(path)
+
+    if document_path.suffix.lower() == ".txt":
+        return load_txt(document_path)
+
+    raise ValueError("Сейчас поддерживаются только txt-документы.")
+
+
+def load_txt(path: Path) -> str:
+    """Прочитать txt-документ в UTF-8 и нормализовать его содержимое."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ValueError("Не удалось прочитать txt-документ в UTF-8.") from error
+    except OSError as error:
+        raise ValueError("Не удалось прочитать документ.") from error
+
+    normalized_text = normalize_text(text)
+    if not normalized_text:
+        raise ValueError("Документ пустой.")
+
+    return normalized_text
+
+
+def normalize_text(text: str) -> str:
+    """Нормализовать пробелы и переносы строк без изменения смысла текста."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = []
+    for line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        lines.append(line)
+
+    normalized_text = "\n".join(lines)
+    normalized_text = re.sub(r"\n{3,}", "\n\n", normalized_text)
+
+    return normalized_text.strip()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI."""
     args = parse_args(argv)
 
     try:
         validate_args(args)
+        text = load_document(args.document)
     except ValueError as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 2
 
-    print("CLI и проверки аргументов работают.")
+    print("CLI и загрузка документа работают.")
     print("Текущая конфигурация:")
     print(f"document: {args.document}")
     print(f"question: {args.question}")
@@ -103,8 +146,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"top_k: {args.top_k}")
     print(f"retriever: {args.retriever}")
     print(f"answerer: {args.answerer}")
+    print("Статистика документа:")
+    print(f"characters: {len(text)}")
+    print(f"words: {len(text.split())}")
+    print("Preview:")
+    print(text[:300])
     print(
-        "Загрузка документа, retrieval и answerer будут реализованы "
+        "Чанкинг, retrieval и answerer будут реализованы "
         "на следующих этапах."
     )
 
