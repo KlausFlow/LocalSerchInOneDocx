@@ -504,47 +504,33 @@ def make_preview(text: str, limit: int = 200) -> str:
     return preview
 
 
-def print_pipeline_stub_summary(
-    args: argparse.Namespace,
-    text: str,
-    chunks: list[dict[str, object]],
-    retrieved_chunks: list[dict[str, object]],
+def print_result(
+    question: str,
     answer: str,
+    retrieved_chunks: list[dict[str, object]],
 ) -> None:
-    """Вывести единый summary для текущего состояния pipeline."""
-    print("CLI, загрузка документа, чанкинг, retrieval и answerer работают.")
-    print("Текущая конфигурация:")
-    print(f"document: {args.document}")
-    print(f"question: {args.question}")
-    print(f"chunk_size: {args.chunk_size}")
-    print(f"overlap: {args.overlap}")
-    print(f"top_k: {args.top_k}")
-    print(f"retriever: {args.retriever}")
-    print(f"answerer: {args.answerer}")
-
-    print("Статистика документа:")
-    print(f"characters: {len(text)}")
-    print(f"words: {len(text.split())}")
-    print(f"chunks: {len(chunks)}")
-    print(f"retrieved_chunks: {len(retrieved_chunks)}")
-
+    """Вывести финальный результат MVP."""
+    print("Вопрос:")
+    print(question)
+    print()
     print("Ответ:")
     print(answer)
-
-    print("Найденные источники:")
+    print()
+    print("Источники:")
     if not retrieved_chunks:
         print("Релевантные фрагменты не найдены.")
+        return
+
     for source_number, chunk in enumerate(retrieved_chunks, start=1):
-        preview = make_preview(str(chunk["text"]), limit=200)
+        preview = make_preview(str(chunk["text"]), limit=300)
         print(
-            f"source {source_number}: "
+            f"{source_number}) "
             f"chunk {chunk['id']}, "
             f"score={float(chunk['score']):.3f}, "
-            f"words={chunk['start_word']}-{chunk['end_word']} | "
-            f"{preview}"
+            f"words={chunk['start_word']}-{chunk['end_word']}"
         )
-
-    print("Финальное оформление вывода будет уточнено на следующем этапе.")
+        print(preview)
+        print()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -561,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 2
 
-    print_pipeline_stub_summary(args, text, chunks, retrieved_chunks, answer)
+    print_result(args.question, answer, retrieved_chunks)
     return 0
 
 
