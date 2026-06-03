@@ -1,20 +1,26 @@
 """CLI-скрипт для MVP RAG по одному txt-документу.
 
 На текущем этапе реализованы разбор аргументов, проверки, загрузка
-txt-документа, нормализация текста и чанкинг по словам. Локальный
-retrieval и формирование ответа будут добавлены на следующих этапах.
+txt-документа, нормализация текста, чанкинг по словам и локальный
+retrieval. Формирование ответа будет добавлено на следующем этапе.
 """
 
 import argparse
+from collections import Counter
+import math
 import re
 import sys
 from pathlib import Path
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 DEFAULT_CHUNK_SIZE = 80
 DEFAULT_OVERLAP = 20
 DEFAULT_TOP_K = 3
 DEFAULT_RETRIEVER = "hybrid"
 DEFAULT_ANSWERER = "simple"
+MIN_RETRIEVAL_SCORE = 0.45
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -182,6 +188,147 @@ def split_into_chunks(
     return chunks
 
 
+def tokenize_words(text: str) -> list[str]:
+    """Вернуть lowercase-токены из русских/английских букв и цифр."""
+    return re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text.lower())
+
+
+def bm25_scores(
+    question: str,
+    chunks: list[dict[str, object]],
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> list[float]:
+    """Посчитать BM25 score для каждого чанка."""
+    if not chunks:
+        return []
+
+    query_terms = tokenize_words(question)
+    if not query_terms:
+        return [0.0] * len(chunks)
+
+    chunk_tokens = [tokenize_words(str(chunk["text"])) for chunk in chunks]
+    chunk_lengths = [len(tokens) for tokens in chunk_tokens]
+    avgdl = sum(chunk_lengths) / len(chunk_lengths)
+    if avgdl == 0:
+        return [0.0] * len(chunks)
+
+    term_frequencies = [Counter(tokens) for tokens in chunk_tokens]
+    query_vocabulary = set(query_terms)
+    document_frequency = {
+        term: sum(1 for tokens in chunk_tokens if term in tokens)
+        for term in query_vocabulary
+    }
+
+    n_chunks = len(chunks)
+    scores: list[float] = []
+    for frequencies, chunk_length in zip(term_frequencies, chunk_lengths):
+        score = 0.0
+        for term in query_terms:
+            tf = frequencies.get(term, 0)
+            if tf == 0:
+                continue
+
+            df = document_frequency[term]
+            idf = math.log(1 + (n_chunks - df + 0.5) / (df + 0.5))
+            denominator = tf + k1 * (1 - b + b * chunk_length / avgdl)
+            score += idf * (tf * (k1 + 1)) / denominator
+        scores.append(score)
+
+    return scores
+
+
+def tfidf_char_scores(
+    question: str,
+    chunks: list[dict[str, object]],
+) -> list[float]:
+    """Посчитать TF-IDF char n-gram similarity для каждого чанка."""
+    if not chunks:
+        return []
+    if not question.strip():
+        return [0.0] * len(chunks)
+
+    chunk_texts = [str(chunk["text"]) for chunk in chunks]
+    if not any(text.strip() for text in chunk_texts):
+        return [0.0] * len(chunks)
+
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5))
+    try:
+        matrix = vectorizer.fit_transform([question, *chunk_texts])
+    except ValueError:
+        return [0.0] * len(chunks)
+
+    similarities = cosine_similarity(matrix[0:1], matrix[1:]).ravel()
+    return [float(score) for score in similarities]
+
+
+def normalize_scores(scores: list[float]) -> list[float]:
+    """Привести scores к диапазону 0..1."""
+    if not scores:
+        return []
+
+    min_score = min(scores)
+    max_score = max(scores)
+    if max_score == min_score:
+        return [0.0] * len(scores)
+
+    return [(score - min_score) / (max_score - min_score) for score in scores]
+
+
+def retrieve_top_chunks(
+    question: str,
+    chunks: list[dict[str, object]],
+    top_k: int,
+) -> list[dict[str, object]]:
+    """Вернуть top-k релевантных чанков по hybrid retrieval."""
+    if not chunks or top_k <= 0:
+        return []
+
+    raw_bm25 = bm25_scores(question, chunks)
+    raw_tfidf = tfidf_char_scores(question, chunks)
+    bm25 = normalize_scores(raw_bm25)
+    tfidf = normalize_scores(raw_tfidf)
+    if len(chunks) == 1:
+        bm25 = [1.0 if raw_bm25 and raw_bm25[0] > 0 else 0.0]
+        tfidf = [1.0 if raw_tfidf and raw_tfidf[0] > 0 else 0.0]
+
+    final_scores = [
+        0.6 * bm25_score + 0.4 * tfidf_score
+        for bm25_score, tfidf_score in zip(bm25, tfidf)
+    ]
+
+    if not final_scores or max(final_scores) == 0:
+        return []
+
+    ranked_indices = sorted(
+        range(len(chunks)),
+        key=lambda index: final_scores[index],
+        reverse=True,
+    )
+
+    retrieved_chunks: list[dict[str, object]] = []
+    for index in ranked_indices:
+        if final_scores[index] < MIN_RETRIEVAL_SCORE:
+            continue
+
+        chunk = chunks[index]
+        retrieved_chunks.append(
+            {
+                "id": chunk["id"],
+                "text": chunk["text"],
+                "start_word": chunk["start_word"],
+                "end_word": chunk["end_word"],
+                "score": float(final_scores[index]),
+                "bm25_score": float(bm25[index]),
+                "tfidf_score": float(tfidf[index]),
+            }
+        )
+        if len(retrieved_chunks) == top_k:
+            break
+
+    return retrieved_chunks
+
+
 def make_preview(text: str, limit: int = 200) -> str:
     """Сделать однострочный preview текста с ограничением длины."""
     preview = " ".join(text.split())
@@ -194,9 +341,10 @@ def print_pipeline_stub_summary(
     args: argparse.Namespace,
     text: str,
     chunks: list[dict[str, object]],
+    retrieved_chunks: list[dict[str, object]],
 ) -> None:
     """Вывести единый summary для текущего состояния pipeline."""
-    print("CLI, загрузка документа и чанкинг работают.")
+    print("CLI, загрузка документа, чанкинг и retrieval работают.")
     print("Текущая конфигурация:")
     print(f"document: {args.document}")
     print(f"question: {args.question}")
@@ -210,16 +358,22 @@ def print_pipeline_stub_summary(
     print(f"characters: {len(text)}")
     print(f"words: {len(text.split())}")
     print(f"chunks: {len(chunks)}")
+    print(f"retrieved_chunks: {len(retrieved_chunks)}")
 
-    print("Preview первых чанков:")
-    for chunk in chunks[:3]:
-        chunk_id = chunk["id"]
-        start_word = chunk["start_word"]
-        end_word = chunk["end_word"]
+    print("Найденные источники:")
+    if not retrieved_chunks:
+        print("Релевантные фрагменты не найдены.")
+    for source_number, chunk in enumerate(retrieved_chunks, start=1):
         preview = make_preview(str(chunk["text"]), limit=200)
-        print(f"chunk {chunk_id}: {start_word}-{end_word} | {preview}")
+        print(
+            f"source {source_number}: "
+            f"chunk {chunk['id']}, "
+            f"score={float(chunk['score']):.3f}, "
+            f"words={chunk['start_word']}-{chunk['end_word']} | "
+            f"{preview}"
+        )
 
-    print("Retrieval и answerer будут реализованы на следующих этапах.")
+    print("Answerer будет реализован на следующем этапе.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -230,11 +384,12 @@ def main(argv: list[str] | None = None) -> int:
         validate_args(args)
         text = load_document(args.document)
         chunks = split_into_chunks(text, args.chunk_size, args.overlap)
+        retrieved_chunks = retrieve_top_chunks(args.question, chunks, args.top_k)
     except ValueError as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 2
 
-    print_pipeline_stub_summary(args, text, chunks)
+    print_pipeline_stub_summary(args, text, chunks, retrieved_chunks)
     return 0
 
 

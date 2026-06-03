@@ -41,3 +41,5 @@ results/
 # Local input documents for manual testing
 document.txt
 test_document.txt
+_manual_retrieval_check.py
+_manual_retrieval_document.txt
