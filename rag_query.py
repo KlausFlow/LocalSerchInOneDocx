@@ -1,8 +1,8 @@
 """CLI-скрипт для MVP RAG по одному txt-документу.
 
 На текущем этапе реализованы разбор аргументов, проверки, загрузка
-txt-документа и нормализация текста. Чанкинг, локальный retrieval и
-формирование ответа будут добавлены на следующих этапах.
+txt-документа, нормализация текста и чанкинг по словам. Локальный
+retrieval и формирование ответа будут добавлены на следующих этапах.
 """
 
 import argparse
@@ -126,18 +126,77 @@ def normalize_text(text: str) -> str:
     return normalized_text.strip()
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Точка входа CLI."""
-    args = parse_args(argv)
+def split_into_chunks(
+    text: str,
+    chunk_size: int,
+    overlap: int,
+) -> list[dict[str, object]]:
+    """Разбить нормализованный текст на чанки по словам."""
+    if chunk_size <= 0:
+        raise ValueError("Размер чанка должен быть больше 0.")
+    if overlap < 0:
+        raise ValueError("Перекрытие чанков не должно быть отрицательным.")
+    if overlap >= chunk_size:
+        raise ValueError("Перекрытие чанков должно быть меньше размера чанка.")
 
-    try:
-        validate_args(args)
-        text = load_document(args.document)
-    except ValueError as error:
-        print(f"Ошибка: {error}", file=sys.stderr)
-        return 2
+    words = text.split()
+    if not words:
+        raise ValueError("Документ пустой.")
 
-    print("CLI и загрузка документа работают.")
+    def make_chunk(chunk_id: int, start: int, end: int) -> dict[str, object]:
+        return {
+            "id": chunk_id,
+            "text": " ".join(words[start:end]),
+            "start_word": start + 1,
+            "end_word": end,
+        }
+
+    if len(words) <= chunk_size:
+        return [make_chunk(1, 0, len(words))]
+
+    chunks: list[dict[str, object]] = []
+    step = chunk_size - overlap
+    start = 0
+
+    while start + chunk_size <= len(words):
+        chunks.append(make_chunk(len(chunks) + 1, start, start + chunk_size))
+        start += step
+
+    last_full_end = int(chunks[-1]["end_word"])
+    tail_size = len(words) - last_full_end
+
+    if tail_size == 0:
+        return chunks
+
+    tail_threshold = chunk_size * 0.4
+    if tail_size <= tail_threshold:
+        last_start = int(chunks[-1]["start_word"]) - 1
+        chunks[-1]["text"] = " ".join(words[last_start:])
+        chunks[-1]["end_word"] = len(words)
+        return chunks
+
+    tail_start = last_full_end
+    chunk_start = max(0, tail_start - overlap)
+    chunks.append(make_chunk(len(chunks) + 1, chunk_start, len(words)))
+
+    return chunks
+
+
+def make_preview(text: str, limit: int = 200) -> str:
+    """Сделать однострочный preview текста с ограничением длины."""
+    preview = " ".join(text.split())
+    if len(preview) > limit:
+        return preview[:limit].rstrip() + "..."
+    return preview
+
+
+def print_pipeline_stub_summary(
+    args: argparse.Namespace,
+    text: str,
+    chunks: list[dict[str, object]],
+) -> None:
+    """Вывести единый summary для текущего состояния pipeline."""
+    print("CLI, загрузка документа и чанкинг работают.")
     print("Текущая конфигурация:")
     print(f"document: {args.document}")
     print(f"question: {args.question}")
@@ -146,16 +205,36 @@ def main(argv: list[str] | None = None) -> int:
     print(f"top_k: {args.top_k}")
     print(f"retriever: {args.retriever}")
     print(f"answerer: {args.answerer}")
+
     print("Статистика документа:")
     print(f"characters: {len(text)}")
     print(f"words: {len(text.split())}")
-    print("Preview:")
-    print(text[:300])
-    print(
-        "Чанкинг, retrieval и answerer будут реализованы "
-        "на следующих этапах."
-    )
+    print(f"chunks: {len(chunks)}")
 
+    print("Preview первых чанков:")
+    for chunk in chunks[:3]:
+        chunk_id = chunk["id"]
+        start_word = chunk["start_word"]
+        end_word = chunk["end_word"]
+        preview = make_preview(str(chunk["text"]), limit=200)
+        print(f"chunk {chunk_id}: {start_word}-{end_word} | {preview}")
+
+    print("Retrieval и answerer будут реализованы на следующих этапах.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Точка входа CLI."""
+    args = parse_args(argv)
+
+    try:
+        validate_args(args)
+        text = load_document(args.document)
+        chunks = split_into_chunks(text, args.chunk_size, args.overlap)
+    except ValueError as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 2
+
+    print_pipeline_stub_summary(args, text, chunks)
     return 0
 
 
